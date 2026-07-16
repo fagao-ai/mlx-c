@@ -1,0 +1,37 @@
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+index 4f941ce..bf14f40 100644
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -2209,6 +2209,7 @@ class Split : public Primitive {
+   DEFINE_GRADS()
+   DEFINE_NAME(Split)
+   bool is_equivalent(const Primitive& other) const override;
++  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+   std::pair<Shape, int> state() const {
+     return {indices_, axis_};
+   };
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+index 47b4f45..6d5d94b 100644
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -5316,6 +5316,20 @@ bool Split::is_equivalent(const Primitive& other) const {
+   return axis_ == s_other.axis_ && indices_ == s_other.indices_;
+ }
+ 
++std::vector<Shape> Split::output_shapes(const std::vector<array>& inputs) {
++  const auto& input_shape = inputs.at(0).shape();
++  std::vector<Shape> shapes(indices_.size() + 1, input_shape);
++  if (indices_.empty()) {
++    return shapes;
++  }
++  shapes[0][axis_] = indices_[0];
++  for (int i = 1; i < indices_.size(); ++i) {
++    shapes[i][axis_] = indices_[i] - indices_[i - 1];
++  }
++  shapes.back()[axis_] = input_shape[axis_] - indices_.back();
++  return shapes;
++}
++
+ std::vector<array> Square::vjp(
+     const std::vector<array>& primals,
+     const std::vector<array>& cotangents,
