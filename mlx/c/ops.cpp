@@ -57,6 +57,31 @@ extern "C" int mlx_addmm(
   }
   return 0;
 }
+extern "C" int mlx_addmm_gelu_approximate(
+    mlx_array* res,
+    const mlx_array c,
+    const mlx_array a,
+    const mlx_array b,
+    float alpha,
+    float beta,
+    const mlx_stream s) {
+  try {
+    mlx_array_set_(
+        *res,
+        mlx::core::addmm(
+            mlx_array_get_(c),
+            mlx_array_get_(a),
+            mlx_array_get_(b),
+            alpha,
+            beta,
+            mlx_stream_get_(s),
+            true));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
 extern "C" int mlx_all_axes(
     mlx_array* res,
     const mlx_array a,

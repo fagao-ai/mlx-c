@@ -42,6 +42,19 @@ int mlx_addmm(
     float alpha,
     float beta,
     const mlx_stream s);
+/**
+ * Compute approximate_gelu(beta * C + alpha * (A @ B)) on Metal in one
+ * Steel GEMM epilogue. This inference-only operation requires a non-empty
+ * FP32 GEMM and is rejected by the CPU backend.
+ */
+int mlx_addmm_gelu_approximate(
+    mlx_array* res,
+    const mlx_array c,
+    const mlx_array a,
+    const mlx_array b,
+    float alpha,
+    float beta,
+    const mlx_stream s);
 int mlx_all_axes(
     mlx_array* res,
     const mlx_array a,

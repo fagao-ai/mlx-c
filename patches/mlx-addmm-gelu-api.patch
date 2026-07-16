@@ -1,0 +1,126 @@
+diff --git a/mlx/backend/cpu/matmul.cpp b/mlx/backend/cpu/matmul.cpp
+index 7df3316..ab28708 100644
+--- a/mlx/backend/cpu/matmul.cpp
++++ b/mlx/backend/cpu/matmul.cpp
+@@ -132,6 +132,10 @@ void Matmul::eval_cpu(const std::vector<array>& inputs, array& out) {
+ }
+ 
+ void AddMM::eval_cpu(const std::vector<array>& inputs, array& out) {
++  if (fuse_gelu_approximate_) {
++    throw std::runtime_error(
++        "[addmm] fused approximate GELU is implemented for Metal only.");
++  }
+   if (out.size() == 0) {
+     out.set_data(allocator::malloc(out.nbytes()));
+     return;
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index defcc2f..b845ea4 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -5469,7 +5469,8 @@ array addmm(
+     array b,
+     const float& alpha /* = 1.f */,
+     const float& beta /* = 1.f */,
+-    StreamOrDevice s /* = {} */) {
++    StreamOrDevice s /* = {} */,
++    bool fuse_gelu_approximate /* = false */) {
+   int in_a_ndim = a.ndim();
+   int in_b_ndim = b.ndim();
+ 
+@@ -5534,7 +5535,8 @@ array addmm(
+     auto out = array(
+         {a.shape(0), b.shape(1)},
+         out_type,
+-        std::make_shared<AddMM>(to_stream(s), alpha, beta),
++        std::make_shared<AddMM>(
++            to_stream(s), alpha, beta, fuse_gelu_approximate),
+         {a, b, c});
+     return reshape(out, out_shape, s);
+   }
+@@ -5590,7 +5592,7 @@ array addmm(
+   auto out = array(
+       std::move(out_shape),
+       out_type,
+-      std::make_shared<AddMM>(to_stream(s), alpha, beta),
++      std::make_shared<AddMM>(to_stream(s), alpha, beta, fuse_gelu_approximate),
+       {a, b, c});
+ 
+   // Remove the possibly inserted singleton dimensions
+diff --git a/mlx/ops.h b/mlx/ops.h
+index 208964d..6001225 100644
+--- a/mlx/ops.h
++++ b/mlx/ops.h
+@@ -1562,7 +1562,8 @@ MLX_API array addmm(
+     array b,
+     const float& alpha = 1.f,
+     const float& beta = 1.f,
+-    StreamOrDevice s = {});
++    StreamOrDevice s = {},
++    bool fuse_gelu_approximate = false);
+ 
+ /** Compute matrix product with block masking */
+ MLX_API array block_masked_mm(
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+index 46d6705..b6d94fc 100644
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -342,7 +342,9 @@ std::vector<array> AddMM::jvp(
+ 
+ bool AddMM::is_equivalent(const Primitive& other) const {
+   const AddMM& a_other = static_cast<const AddMM&>(other);
+-  return (alpha_ == a_other.alpha_ && beta_ == a_other.beta_);
++  return (
++      alpha_ == a_other.alpha_ && beta_ == a_other.beta_ &&
++      fuse_gelu_approximate_ == a_other.fuse_gelu_approximate_);
+ }
+ 
+ std::vector<Shape> AddMM::output_shapes(const std::vector<array>& inputs) {
+@@ -361,7 +363,8 @@ std::pair<std::vector<array>, std::vector<int>> AddMM::vmap(
+   auto a = maybe_move_ax(inputs[0], axes[0]);
+   auto b = maybe_move_ax(inputs[1], axes[1]);
+   auto c = maybe_move_ax(inputs[2], axes[2]);
+-  return {{addmm(c, a, b, alpha_, beta_, stream())}, {0}};
++  return {{addmm(c, a, b, alpha_, beta_, stream(), fuse_gelu_approximate_)},
++          {0}};
+ }
+ 
+ bool Arange::is_equivalent(const Primitive& other) const {
+diff --git a/mlx/primitives.h b/mlx/primitives.h
+index 2347ec1..4ae8458 100644
+--- a/mlx/primitives.h
++++ b/mlx/primitives.h
+@@ -189,8 +189,15 @@ class MLX_API Add : public UnaryPrimitive {
+ 
+ class AddMM : public UnaryPrimitive {
+  public:
+-  explicit AddMM(Stream stream, float alpha, float beta)
+-      : UnaryPrimitive(stream), alpha_(alpha), beta_(beta) {}
++  explicit AddMM(
++      Stream stream,
++      float alpha,
++      float beta,
++      bool fuse_gelu_approximate = false)
++      : UnaryPrimitive(stream),
++        alpha_(alpha),
++        beta_(beta),
++        fuse_gelu_approximate_(fuse_gelu_approximate) {}
+ 
+   void eval_cpu(const std::vector<array>& inputs, array& out) override;
+   void eval_gpu(const std::vector<array>& inputs, array& out) override;
+@@ -201,13 +208,14 @@ class AddMM : public UnaryPrimitive {
+ 
+   bool is_equivalent(const Primitive& other) const override;
+   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override;
+-  std::pair<float, float> state() const {
+-    return {alpha_, beta_};
++  std::tuple<float, float, bool> state() const {
++    return {alpha_, beta_, fuse_gelu_approximate_};
+   };
+ 
+  private:
+   const float alpha_;
+   const float beta_;
++  const bool fuse_gelu_approximate_;
+ };
+ 
+ class Arange : public UnaryPrimitive {

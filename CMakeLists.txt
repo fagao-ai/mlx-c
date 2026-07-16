@@ -41,9 +41,12 @@ else()
     # implements this shape but does not precompile or dispatch it. The
     # shapeless compiler also lacks Split shape inference for dynamic inputs.
     PATCH_COMMAND
-      git apply --whitespace=nowarn
+      /bin/sh
+      ${CMAKE_CURRENT_LIST_DIR}/patches/apply-patches.sh
       ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-sdpa-head-dim-72.patch
-      ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-shapeless-split-output-shapes.patch)
+      ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-shapeless-split-output-shapes.patch
+      ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-addmm-gelu-experiment.patch
+      ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-addmm-gelu-api.patch)
   FetchContent_MakeAvailable(mlx)
 endif()
 

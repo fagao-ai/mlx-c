@@ -1,0 +1,212 @@
+diff --git a/mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_fused.h b/mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_fused.h
+index 8583087..0d22892 100644
+--- a/mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_fused.h
++++ b/mlx/backend/metal/kernels/steel/gemm/kernels/steel_gemm_fused.h
+@@ -10,6 +10,7 @@ constant bool has_batch [[function_constant(10)]];
+ 
+ constant bool use_out_source [[function_constant(100)]];
+ constant bool do_axpby [[function_constant(110)]];
++constant bool apply_gelu_approximate [[function_constant(120)]];
+ 
+ constant bool align_M [[function_constant(200)]];
+ constant bool align_N [[function_constant(201)]];
+@@ -166,6 +167,7 @@ template <
+       addmm_params->alpha, addmm_params->beta);
+   const TransformAxpby<AccumType, AccumType> epilogue_op_axpby(
+       addmm_params->alpha, addmm_params->beta);
++  const TransformGeluApproximate<AccumType, AccumType> epilogue_op_gelu;
+ 
+   ///////////////////////////////////////////////////////////////////////////////
+   // MNK aligned loop
+@@ -199,6 +201,9 @@ template <
+             C, addmm_params->ldc, addmm_params->fdc, epilogue_op_add);
+       }
+     }
++    if (apply_gelu_approximate) {
++      mma_op.apply_epilogue(epilogue_op_gelu);
++    }
+ 
+     // Store results to device memory
+     return mma_op.store_result(D, params->ldd);
+@@ -233,6 +238,9 @@ template <
+               C, addmm_params->ldc, addmm_params->fdc, epilogue_op_add);
+         }
+       }
++      if (apply_gelu_approximate) {
++        mma_op.apply_epilogue(epilogue_op_gelu);
++      }
+ 
+       // Store results to device memory
+       return mma_op.store_result(D, params->ldd);
+@@ -268,6 +276,9 @@ template <
+               epilogue_op_add);
+         }
+       }
++      if (apply_gelu_approximate) {
++        mma_op.apply_epilogue(epilogue_op_gelu);
++      }
+ 
+       // Store results to device memory
+       return mma_op.store_result_safe(D, params->ldd, short2(tgp_bn, tgp_bm));
+@@ -303,6 +314,9 @@ template <
+               epilogue_op_add);
+         }
+       }
++      if (apply_gelu_approximate) {
++        mma_op.apply_epilogue(epilogue_op_gelu);
++      }
+ 
+       // Store results to device memory
+       return mma_op.store_result_safe(D, params->ldd, short2(tgp_bn, tgp_bm));
+diff --git a/mlx/backend/metal/kernels/steel/gemm/transforms.h b/mlx/backend/metal/kernels/steel/gemm/transforms.h
+index 0282a12..cbf2263 100644
+--- a/mlx/backend/metal/kernels/steel/gemm/transforms.h
++++ b/mlx/backend/metal/kernels/steel/gemm/transforms.h
+@@ -53,6 +53,16 @@ struct TransformAxpby {
+   }
+ };
+ 
++template <typename OutT, typename InT>
++struct TransformGeluApproximate {
++  static METAL_FUNC OutT apply(InT x) {
++    const float xf = static_cast<float>(x);
++    const float x3 = xf * xf * xf;
++    const float inner = 0.7978845608028654f * (xf + 0.044715f * x3);
++    return static_cast<OutT>(0.5f * xf * (1.0f + metal::precise::tanh(inner)));
++  }
++};
++
+ template <typename T>
+ struct AccumHelper {
+   typedef float accum_type;
+@@ -69,4 +79,4 @@ struct BlockSwizzle {
+ };
+ 
+ } // namespace steel
+-} // namespace mlx
+\ No newline at end of file
++} // namespace mlx
+diff --git a/mlx/backend/metal/matmul.cpp b/mlx/backend/metal/matmul.cpp
+index 5fb1013..cf99514 100644
+--- a/mlx/backend/metal/matmul.cpp
++++ b/mlx/backend/metal/matmul.cpp
+@@ -362,7 +362,8 @@ void steel_matmul_regular_axpby(
+     int64_t matrix_stride_out,
+     int64_t C_batch_stride /* = 0*/,
+     float alpha /* = 1.0f */,
+-    float beta /* = 0.0f */) {
++    float beta /* = 0.0f */,
++    bool apply_gelu_approximate /* = false */) {
+   using namespace mlx::steel;
+ 
+   // Determine dispatch kernel
+@@ -397,6 +398,7 @@ void steel_matmul_regular_axpby(
+       {&has_batch, MTL::DataType::DataTypeBool, 10},
+       {&use_out_source, MTL::DataType::DataTypeBool, 100},
+       {&do_axpby, MTL::DataType::DataTypeBool, 110},
++      {&apply_gelu_approximate, MTL::DataType::DataTypeBool, 120},
+       {&align_M, MTL::DataType::DataTypeBool, 200},
+       {&align_N, MTL::DataType::DataTypeBool, 201},
+       {&align_K, MTL::DataType::DataTypeBool, 202},
+@@ -406,6 +408,7 @@ void steel_matmul_regular_axpby(
+   kname << "_has_batch_" << (has_batch ? 't' : 'n')
+         << "_use_out_source_" << (use_out_source ? 't' : 'n')
+         << "_do_axpby_" << (do_axpby ? 't' : 'n')
++        << "_apply_gelu_approximate_" << (apply_gelu_approximate ? 't' : 'n')
+         << "_align_M_" << (align_M ? 't' : 'n')
+         << "_align_N_" << (align_N ? 't' : 'n')
+         << "_align_K_" << (align_K ? 't' : 'n'); // clang-format on
+@@ -860,7 +863,8 @@ void steel_matmul_axpby(
+     Strides B_batch_stride /* = {} */,
+     Strides C_batch_stride /* = {} */,
+     float alpha /* = 1.0f */,
+-    float beta /* = 0.0f */) {
++    float beta /* = 0.0f */,
++    bool apply_gelu_approximate /* = false */) {
+   if (batch_shape.empty()) {
+     /////////////////////////////////////////////////////////////////////////////
+     // Check and collapse batch dimensions
+@@ -920,7 +924,7 @@ void steel_matmul_axpby(
+ 
+   // Case 1: Small M×N with large K, use SIMD split-K
+   // Max and Ultra dispatch larger sizes to splitk
+-  if (!use_nax && batch_size_out == 1 && (_tm * _tn) <= min_tmn_threshold &&
++  if (!apply_gelu_approximate && !use_nax && batch_size_out == 1 && (_tm * _tn) <= min_tmn_threshold &&
+       _tk >= 8 && K >= std::max(M, N)) {
+     return steel_gemm_splitk_axpby<CHECK_AB>(
+         /* const Stream& s = */ s,
+@@ -943,7 +947,7 @@ void steel_matmul_axpby(
+   }
+ 
+   // Case 2: Large K with sufficient M, N, and NAX is available, use NAX split-K
+-  if (use_nax && batch_size_out == 1 &&
++  if (!apply_gelu_approximate && use_nax && batch_size_out == 1 &&
+       (K >= 3 * std::max(M, N) ||
+        (std::max(M, N) <= 1024 && K > 2 * std::max(M, N)))) {
+     return steel_gemm_splitk_axpby_nax<CHECK_AB>(
+@@ -980,7 +984,7 @@ void steel_matmul_axpby(
+   int64_t B_batch_stride_ = B_batch_stride.empty() ? 0 : B_batch_stride.back();
+   int64_t C_batch_stride_ = C_batch_stride.empty() ? 0 : C_batch_stride.back();
+ 
+-  if (use_nax) {
++  if (!apply_gelu_approximate && use_nax) {
+     return steel_matmul_regular_axpby_nax<CHECK_AB>(
+         /* const Stream& s = */ s,
+         /* metal::Device& d = */ d,
+@@ -1032,7 +1036,8 @@ void steel_matmul_axpby(
+       /* int64_t matrix_stride_out = */ int64_t(M) * N,
+       /* int64_t C_batch_stride = */ C_batch_stride_,
+       /* float alpha = */ alpha,
+-      /* float beta = */ beta);
++      /* float beta = */ beta,
++      /* bool apply_gelu_approximate = */ apply_gelu_approximate);
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+@@ -1373,6 +1378,12 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+   int M = a_pre.shape(-2);
+   int N = b_pre.shape(-1);
+   int K = a_pre.shape(-1);
++  if (fuse_gelu_approximate_ &&
++      (out.dtype() != float32 || std::min(M, N) == 1 || K == 0)) {
++    throw std::runtime_error(
++        "[addmm] fused approximate GELU requires a non-empty FP32 GEMM.");
++  }
++  const bool apply_gelu_approximate = fuse_gelu_approximate_;
+ 
+   // Keep a vector with copies to be cleared in the completed buffer to release
+   // the arrays
+@@ -1460,7 +1469,8 @@ void AddMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+       /* Strides B_batch_stride = */ B_batch_stride,
+       /* Strides B_batch_stride = */ C_batch_stride,
+       /* float alpha = */ alpha_,
+-      /* float beta = */ beta_);
++      /* float beta = */ beta_,
++      /* bool apply_gelu_approximate = */ apply_gelu_approximate);
+ }
+ 
+ ///////////////////////////////////////////////////////////////////////////////
+diff --git a/mlx/backend/metal/matmul.h b/mlx/backend/metal/matmul.h
+index 218664b..b040e52 100644
+--- a/mlx/backend/metal/matmul.h
++++ b/mlx/backend/metal/matmul.h
+@@ -31,7 +31,8 @@ void steel_matmul_regular_axpby(
+     int64_t matrix_stride_out,
+     int64_t C_batch_stride = 0,
+     float alpha = 1.0f,
+-    float beta = 0.0f);
++    float beta = 0.0f,
++    bool apply_gelu_approximate = false);
+ 
+ inline void steel_matmul_regular(
+     const Stream& s,
+@@ -100,7 +101,8 @@ void steel_matmul_axpby(
+     Strides B_batch_stride = {},
+     Strides C_batch_stride = {},
+     float alpha = 1.0f,
+-    float beta = 0.0f);
++    float beta = 0.0f,
++    bool apply_gelu_approximate = false);
+ 
+ inline void steel_matmul(
+     const Stream& s,
