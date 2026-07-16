@@ -186,6 +186,18 @@ int mlx_fast_rope_dynamic(
     const mlx_array offset,
     const mlx_array freqs /* may be null */,
     const mlx_stream s);
+/**
+ * Apply PaddleOCR-VL's 2D RoPE to the Q and K slices of a packed FP32 QKV
+ * projection. The result has shape [2, 16, L, 72], ordered as Q then K.
+ * This Metal-only operation expects qkv=[L,3456] and cosine/sine=[L,72] or
+ * [L,1,72].
+ */
+int mlx_fast_paddleocr_rope_2d_qk(
+    mlx_array* res,
+    const mlx_array qkv,
+    const mlx_array cosine,
+    const mlx_array sine,
+    const mlx_stream s);
 int mlx_fast_scaled_dot_product_attention(
     mlx_array* res,
     const mlx_array queries,

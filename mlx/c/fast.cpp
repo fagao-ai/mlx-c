@@ -601,6 +601,90 @@ extern "C" int mlx_fast_rope_dynamic(
   }
   return 0;
 }
+
+namespace {
+
+constexpr const char* kPaddleOcrRope2dQkSource = R"metal(
+  uint dim = thread_position_in_grid.x;
+  uint token = thread_position_in_grid.y;
+  uint qk_head = thread_position_in_grid.z;
+  uint kind = qk_head >> 4;
+  uint head = qk_head & 15;
+  uint input_base = token * 3456 + kind * 1152 + head * 72;
+  uint pair = dim < 36 ? dim + 36 : dim - 36;
+  float rotated = dim < 36 ? -qkv[input_base + pair] : qkv[input_base + pair];
+  uint output_index = (qk_head * qkv_shape[0] + token) * 72 + dim;
+  qk[output_index] = qkv[input_base + dim] * cosine[token * 72 + dim] +
+      rotated * sine[token * 72 + dim];
+)metal";
+
+const mlx::core::fast::CustomKernelFunction& paddleocr_rope_2d_qk_kernel() {
+  static const auto kernel = mlx::core::fast::metal_kernel(
+      "paddleocr_rope_2d_qk",
+      {"qkv", "cosine", "sine"},
+      {"qk"},
+      kPaddleOcrRope2dQkSource,
+      "",
+      true,
+      false);
+  return kernel;
+}
+
+void validate_paddleocr_rope_2d_qk(
+    const mlx::core::array& qkv,
+    const mlx::core::array& cosine,
+    const mlx::core::array& sine) {
+  const auto token_count = qkv.shape(0);
+  const bool valid_trig_shape =
+      (cosine.ndim() == 2 && sine.ndim() == 2 &&
+       cosine.shape(0) == token_count && sine.shape(0) == token_count &&
+       cosine.shape(1) == 72 && sine.shape(1) == 72) ||
+      (cosine.ndim() == 3 && sine.ndim() == 3 &&
+       cosine.shape(0) == token_count && sine.shape(0) == token_count &&
+       cosine.shape(1) == 1 && sine.shape(1) == 1 &&
+       cosine.shape(2) == 72 && sine.shape(2) == 72);
+  if (qkv.ndim() != 2 || qkv.shape(1) != 3456 ||
+      !valid_trig_shape ||
+      qkv.dtype() != mlx::core::float32 ||
+      cosine.dtype() != mlx::core::float32 ||
+      sine.dtype() != mlx::core::float32) {
+    throw std::invalid_argument(
+        "[paddleocr_rope_2d_qk] expected FP32 qkv=[L,3456] and cosine/sine=[L,72] or [L,1,72].");
+  }
+}
+
+} // namespace
+
+extern "C" int mlx_fast_paddleocr_rope_2d_qk(
+    mlx_array* res,
+    const mlx_array qkv,
+    const mlx_array cosine,
+    const mlx_array sine,
+    const mlx_stream s) {
+  try {
+    const auto& qkv_array = mlx_array_get_(qkv);
+    const auto& cosine_array = mlx_array_get_(cosine);
+    const auto& sine_array = mlx_array_get_(sine);
+    validate_paddleocr_rope_2d_qk(qkv_array, cosine_array, sine_array);
+
+    const auto token_count = qkv_array.shape(0);
+    auto outputs = paddleocr_rope_2d_qk_kernel()(
+        {qkv_array, cosine_array, sine_array},
+        {{2, 16, token_count, 72}},
+        {mlx::core::float32},
+        {72, token_count, 32},
+        {32, 1, 1},
+        {},
+        std::nullopt,
+        false,
+        mlx_stream_get_(s));
+    mlx_array_set_(*res, std::move(outputs.at(0)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
 extern "C" int mlx_fast_scaled_dot_product_attention(
     mlx_array* res,
     const mlx_array queries,
