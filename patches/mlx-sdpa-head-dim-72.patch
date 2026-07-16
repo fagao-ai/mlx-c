@@ -6,7 +6,7 @@ index 6fb9b5a..ecbc43d 100644
  
  #define instantiate_attn_shapes_helper(iname, itype, mname, mtype)  \
      instantiate_attn(iname, itype, 32, 16, 128, 4, 1, mname, mtype) \
-+    instantiate_attn(iname, itype, 32, 32,  72, 4, 1, mname, mtype) \
++    instantiate_attn(iname, itype, 32, 16,  72, 4, 1, mname, mtype) \
      instantiate_attn(iname, itype, 32, 32,  80, 4, 1, mname, mtype) \
      instantiate_attn(iname, itype, 32, 32,  64, 4, 1, mname, mtype)
  
@@ -14,6 +14,22 @@ diff --git a/mlx/backend/metal/scaled_dot_product_attention.cpp b/mlx/backend/me
 index 6cf7b2b..e46afd5 100644
 --- a/mlx/backend/metal/scaled_dot_product_attention.cpp
 +++ b/mlx/backend/metal/scaled_dot_product_attention.cpp
+@@ -194,10 +194,15 @@ void sdpa_full_self_attention_metal(
+   int wm = 4;
+   int wn = 1;
+ 
+   int bd = q.shape(-1);
+   int bq = 32;
+   int bk = bd < 128 ? 32 : 16;
++
++  // PaddleOCR-VL's D=72 attention benefits from the smaller K tile.
++  if (bd == 72) {
++    bk = 16;
++  }
+ 
+   int B = q.shape(0);
+   int H = q.shape(1);
+   int D = q.shape(3);
 @@ -620,7 +620,8 @@ bool ScaledDotProductAttention::use_fallback(
    const bool sdpa_vector_supported_head_dim =
        query_head_dim == value_head_dim &&
