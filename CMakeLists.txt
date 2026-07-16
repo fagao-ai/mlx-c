@@ -35,7 +35,13 @@ else()
   FetchContent_Declare(
     mlx
     GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-    GIT_TAG v0.31.2)
+    GIT_TAG v0.31.2
+    GIT_SHALLOW TRUE
+    # PaddleOCR-VL's visual tower uses head_dim=72. Upstream MLX 0.31.2
+    # implements this shape but does not precompile or dispatch it.
+    PATCH_COMMAND
+      git apply --whitespace=nowarn
+      ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-sdpa-head-dim-72.patch)
   FetchContent_MakeAvailable(mlx)
 endif()
 

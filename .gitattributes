@@ -1,0 +1,2 @@
+# Unified diff context prefixes intentionally end in a space.
+patches/*.patch -whitespace
