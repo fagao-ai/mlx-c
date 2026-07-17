@@ -168,9 +168,9 @@ index 5fb1013..cf99514 100644
    int N = b_pre.shape(-1);
    int K = a_pre.shape(-1);
 +  if (fuse_gelu_approximate_ &&
-+      (out.dtype() != float32 || std::min(M, N) == 1 || K == 0)) {
++      (std::min(M, N) == 1 || K == 0)) {
 +    throw std::runtime_error(
-+        "[addmm] fused approximate GELU requires a non-empty FP32 GEMM.");
++        "[addmm] fused approximate GELU requires a non-empty GEMM.");
 +  }
 +  const bool apply_gelu_approximate = fuse_gelu_approximate_;
  

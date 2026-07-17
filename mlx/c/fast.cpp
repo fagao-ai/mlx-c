@@ -618,12 +618,53 @@ constexpr const char* kPaddleOcrRope2dQkSource = R"metal(
       rotated * sine[token * 72 + dim];
 )metal";
 
+constexpr const char* kPaddleOcrRope2dQkBfloat16Source = R"metal(
+  uint dim = thread_position_in_grid.x;
+  uint token = thread_position_in_grid.y;
+  uint qk_head = thread_position_in_grid.z;
+  uint kind = qk_head >> 4;
+  uint head = qk_head & 15;
+  uint input_base = token * 3456 + kind * 1152 + head * 72;
+  uint pair = dim < 36 ? dim + 36 : dim - 36;
+  float rotated = dim < 36 ? -qkv[input_base + pair] : qkv[input_base + pair];
+  uint output_index = (qk_head * qkv_shape[0] + token) * 72 + dim;
+  qk[output_index] = static_cast<bfloat>(
+      qkv[input_base + dim] * cosine[token * 72 + dim] +
+      rotated * sine[token * 72 + dim]);
+)metal";
+
 const mlx::core::fast::CustomKernelFunction& paddleocr_rope_2d_qk_kernel() {
   static const auto kernel = mlx::core::fast::metal_kernel(
       "paddleocr_rope_2d_qk",
       {"qkv", "cosine", "sine"},
       {"qk"},
       kPaddleOcrRope2dQkSource,
+      "",
+      true,
+      false);
+  return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+paddleocr_rope_2d_qk_float16_kernel() {
+  static const auto kernel = mlx::core::fast::metal_kernel(
+      "paddleocr_rope_2d_qk_float16",
+      {"qkv", "cosine", "sine"},
+      {"qk"},
+      kPaddleOcrRope2dQkSource,
+      "",
+      true,
+      false);
+  return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction&
+paddleocr_rope_2d_qk_bfloat16_kernel() {
+  static const auto kernel = mlx::core::fast::metal_kernel(
+      "paddleocr_rope_2d_qk_bfloat16",
+      {"qkv", "cosine", "sine"},
+      {"qk"},
+      kPaddleOcrRope2dQkBfloat16Source,
       "",
       true,
       false);
@@ -643,13 +684,15 @@ void validate_paddleocr_rope_2d_qk(
        cosine.shape(0) == token_count && sine.shape(0) == token_count &&
        cosine.shape(1) == 1 && sine.shape(1) == 1 &&
        cosine.shape(2) == 72 && sine.shape(2) == 72);
-  if (qkv.ndim() != 2 || qkv.shape(1) != 3456 ||
-      !valid_trig_shape ||
-      qkv.dtype() != mlx::core::float32 ||
-      cosine.dtype() != mlx::core::float32 ||
-      sine.dtype() != mlx::core::float32) {
+  const bool supported_dtype =
+      qkv.dtype() == mlx::core::float32 ||
+      qkv.dtype() == mlx::core::float16 ||
+      qkv.dtype() == mlx::core::bfloat16;
+  if (qkv.ndim() != 2 || qkv.shape(1) != 3456 || !valid_trig_shape ||
+      !supported_dtype || cosine.dtype() != qkv.dtype() ||
+      sine.dtype() != qkv.dtype()) {
     throw std::invalid_argument(
-        "[paddleocr_rope_2d_qk] expected FP32 qkv=[L,3456] and cosine/sine=[L,72] or [L,1,72].");
+        "[paddleocr_rope_2d_qk] expected FP32, FP16, or BF16 qkv=[L,3456] and matching cosine/sine=[L,72] or [L,1,72].");
   }
 }
 
@@ -668,10 +711,15 @@ extern "C" int mlx_fast_paddleocr_rope_2d_qk(
     validate_paddleocr_rope_2d_qk(qkv_array, cosine_array, sine_array);
 
     const auto token_count = qkv_array.shape(0);
-    auto outputs = paddleocr_rope_2d_qk_kernel()(
+    const auto& kernel = qkv_array.dtype() == mlx::core::float16
+        ? paddleocr_rope_2d_qk_float16_kernel()
+        : qkv_array.dtype() == mlx::core::bfloat16
+        ? paddleocr_rope_2d_qk_bfloat16_kernel()
+        : paddleocr_rope_2d_qk_kernel();
+    auto outputs = kernel(
         {qkv_array, cosine_array, sine_array},
         {{2, 16, token_count, 72}},
-        {mlx::core::float32},
+        {qkv_array.dtype()},
         {72, token_count, 32},
         {32, 1, 1},
         {},
