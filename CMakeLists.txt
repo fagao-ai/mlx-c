@@ -35,9 +35,9 @@ else()
   FetchContent_Declare(
     mlx
     GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-    GIT_TAG v0.31.2
+    GIT_TAG v0.32.0
     GIT_SHALLOW TRUE
-    # PaddleOCR-VL's visual tower uses head_dim=72. Upstream MLX 0.31.2
+    # PaddleOCR-VL's visual tower uses head_dim=72. Upstream MLX 0.32.0
     # implements this shape but does not precompile or dispatch it. The
     # shapeless compiler also lacks Split shape inference for dynamic inputs.
     PATCH_COMMAND

@@ -30,11 +30,10 @@ index 6cf7b2b..e46afd5 100644
    int B = q.shape(0);
    int H = q.shape(1);
    int D = q.shape(3);
-@@ -620,7 +620,8 @@ bool ScaledDotProductAttention::use_fallback(
-   const bool sdpa_vector_supported_head_dim =
-       query_head_dim == value_head_dim &&
-       (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
-        query_head_dim == 256);
+@@ -623,7 +623,8 @@ bool ScaledDotProductAttention::use_fallback(
+        (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
+         query_head_dim == 256)) ||
+       (query_head_dim == 192 && value_head_dim == 128);
    const bool sdpa_full_supported_head_dim = query_head_dim == value_head_dim &&
 -      (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128);
 +      (query_head_dim == 64 || query_head_dim == 72 || query_head_dim == 80 ||
