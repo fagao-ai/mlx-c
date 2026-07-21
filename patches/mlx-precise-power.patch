@@ -1,0 +1,14 @@
+diff --git a/mlx/backend/metal/kernels/binary_ops.h b/mlx/backend/metal/kernels/binary_ops.h
+index 7eaa4ec..10e2fc4 100644
+--- a/mlx/backend/metal/kernels/binary_ops.h
++++ b/mlx/backend/metal/kernels/binary_ops.h
+@@ -219,6 +219,8 @@ struct Power {
+   template <typename T>
+   metal::enable_if_t<!metal::is_integral_v<T>, T> operator()(T base, T exp) {
+-    return metal::pow(base, exp);
++    // Runtime-compiled metal::pow resolves to the fast implementation even in
++    // safe math mode. Use precise power to match precompiled Metal kernels.
++    return metal::precise::pow(base, exp);
+   }
+ 
+   template <typename T>
