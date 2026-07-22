@@ -6,7 +6,24 @@
 #include "mlx/c/fast.h"
 #include "mlx/c/error.h"
 #include "mlx/c/private/mlx.h"
+#include "mlx/compile.h"
 #include "mlx/fast.h"
+#include "mlx/ops.h"
+
+namespace {
+auto& compiled_swiglu() {
+  static auto compiled = mlx::core::compile(
+      [](const std::vector<mlx::core::array>& inputs) {
+        const auto& gate = inputs[0];
+        const auto& x = inputs[1];
+        auto activated = mlx::core::multiply(gate, mlx::core::sigmoid(gate));
+        return std::vector<mlx::core::array>{
+            mlx::core::multiply(activated, x)};
+      },
+      true);
+  return compiled;
+}
+} // namespace
 
 struct mlx_fast_cuda_kernel_config_cpp_ {
   std::vector<mlx::core::Shape> output_shapes;
@@ -36,6 +53,21 @@ inline void mlx_fast_cuda_kernel_config_free_(mlx_fast_cuda_kernel_config d) {
   if (d.ctx) {
     delete static_cast<mlx_fast_cuda_kernel_config_cpp_*>(d.ctx);
   }
+}
+
+extern "C" int mlx_fast_compiled_swiglu(
+    mlx_array* res,
+    const mlx_array gate,
+    const mlx_array x) {
+  try {
+    auto outputs = compiled_swiglu()(
+        {mlx_array_get_(gate), mlx_array_get_(x)});
+    mlx_array_set_(*res, std::move(outputs[0]));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
 }
 
 extern "C" mlx_fast_cuda_kernel_config mlx_fast_cuda_kernel_config_new(void) {

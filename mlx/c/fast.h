@@ -166,6 +166,14 @@ int mlx_fast_rms_norm(
     const mlx_array weight /* may be null */,
     float eps,
     const mlx_stream s);
+/**
+ * Compute silu(gate) * x with one shapeless compiled function shared by all
+ * calls in the process.
+ */
+int mlx_fast_compiled_swiglu(
+    mlx_array* res,
+    const mlx_array gate,
+    const mlx_array x);
 int mlx_fast_rope(
     mlx_array* res,
     const mlx_array x,
