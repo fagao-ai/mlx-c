@@ -174,6 +174,17 @@ int mlx_fast_compiled_swiglu(
     mlx_array* res,
     const mlx_array gate,
     const mlx_array x);
+/**
+ * Compute argmax(hidden @ embedding.T) without exposing the full logits
+ * vector. Hidden must contain exactly one vector. The rank-2 embedding table
+ * must contain at least 8192 rows and its row count must be divisible by 32.
+ * Both inputs must use the same FP32, FP16, or BF16 dtype.
+ */
+int mlx_fast_lm_head_argmax(
+    mlx_array* res,
+    const mlx_array hidden,
+    const mlx_array embedding,
+    const mlx_stream s);
 int mlx_fast_rope(
     mlx_array* res,
     const mlx_array x,

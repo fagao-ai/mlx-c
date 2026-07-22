@@ -25,6 +25,158 @@ auto& compiled_swiglu() {
 }
 } // namespace
 
+namespace {
+
+constexpr const char* kLmHeadArgmaxPartialsSource = R"metal(
+  constexpr uint kRowsPerThreadgroup = 32;
+  constexpr uint kRowsPerSimdgroup = 4;
+  constexpr uint kElementsPerThread = 4;
+  constexpr uint kHiddenBlock = 128;
+
+  uint lane = thread_index_in_simdgroup;
+  uint simdgroup = simdgroup_index_in_threadgroup;
+  uint group = threadgroup_position_in_grid.x;
+  uint row_base = group * kRowsPerThreadgroup +
+      simdgroup * kRowsPerSimdgroup;
+  uint hidden_size = embedding_shape[1];
+  uint vocab_size = embedding_shape[0];
+
+  float sums[kRowsPerSimdgroup] = {0.0f};
+  for (uint block = 0; block < hidden_size; block += kHiddenBlock) {
+    uint column = block + lane * kElementsPerThread;
+    for (uint element = 0; element < kElementsPerThread; ++element) {
+      uint current = column + element;
+      float coefficient = current < hidden_size
+          ? static_cast<float>(hidden[current])
+          : 0.0f;
+      for (uint row = 0; row < kRowsPerSimdgroup; ++row) {
+        uint vocab_row = row_base + row;
+        float weight = current < hidden_size && vocab_row < vocab_size
+            ? static_cast<float>(
+                  embedding[vocab_row * hidden_size + current])
+            : 0.0f;
+        sums[row] += weight * coefficient;
+      }
+    }
+  }
+
+  for (uint offset = 16; offset > 0; offset >>= 1) {
+    for (uint row = 0; row < kRowsPerSimdgroup; ++row) {
+      sums[row] += simd_shuffle_down(sums[row], offset);
+    }
+  }
+
+  threadgroup T block_values[kRowsPerThreadgroup];
+  threadgroup uint block_indices[kRowsPerThreadgroup];
+  if (lane == 0) {
+    for (uint row = 0; row < kRowsPerSimdgroup; ++row) {
+      uint slot = simdgroup * kRowsPerSimdgroup + row;
+      uint vocab_row = row_base + row;
+      block_values[slot] = static_cast<T>(sums[row]);
+      block_indices[slot] = vocab_row;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (simdgroup == 0) {
+    T best_value = block_values[lane];
+    uint best_index = block_indices[lane];
+    for (uint offset = 16; offset > 0; offset >>= 1) {
+      T candidate_value = simd_shuffle_down(best_value, offset);
+      uint candidate_index = simd_shuffle_down(best_index, offset);
+      if (best_value < candidate_value ||
+          (best_value == candidate_value && best_index > candidate_index)) {
+        best_value = candidate_value;
+        best_index = candidate_index;
+      }
+    }
+    if (lane == 0) {
+      partial_values[group] = best_value;
+      partial_indices[group] = best_index;
+    }
+  }
+)metal";
+
+constexpr const char* kLmHeadArgmaxFinalSource = R"metal(
+  uint tid = thread_position_in_threadgroup.x;
+  uint partial_count = partial_values_shape[0];
+  T best_value = partial_values[tid];
+  uint best_index = partial_indices[tid];
+  for (uint index = tid + threads_per_threadgroup.x;
+       index < partial_count;
+       index += threads_per_threadgroup.x) {
+    T candidate_value = partial_values[index];
+    uint candidate_index = partial_indices[index];
+    if (best_value < candidate_value ||
+        (best_value == candidate_value && best_index > candidate_index)) {
+      best_value = candidate_value;
+      best_index = candidate_index;
+    }
+  }
+
+  for (uint offset = 16; offset > 0; offset >>= 1) {
+    T candidate_value = simd_shuffle_down(best_value, offset);
+    uint candidate_index = simd_shuffle_down(best_index, offset);
+    if (best_value < candidate_value ||
+        (best_value == candidate_value && best_index > candidate_index)) {
+      best_value = candidate_value;
+      best_index = candidate_index;
+    }
+  }
+
+  threadgroup T simd_values[8];
+  threadgroup uint simd_indices[8];
+  if (thread_index_in_simdgroup == 0) {
+    simd_values[simdgroup_index_in_threadgroup] = best_value;
+    simd_indices[simdgroup_index_in_threadgroup] = best_index;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (simdgroup_index_in_threadgroup == 0) {
+    uint lane = thread_index_in_simdgroup;
+    T group_value = lane < 8 ? simd_values[lane] : simd_values[0];
+    uint group_index = lane < 8 ? simd_indices[lane] : simd_indices[0];
+    for (uint offset = 16; offset > 0; offset >>= 1) {
+      T candidate_value = simd_shuffle_down(group_value, offset);
+      uint candidate_index = simd_shuffle_down(group_index, offset);
+      if (group_value < candidate_value ||
+          (group_value == candidate_value && group_index > candidate_index)) {
+        group_value = candidate_value;
+        group_index = candidate_index;
+      }
+    }
+    if (lane == 0) {
+      token[0] = static_cast<int>(group_index);
+    }
+  }
+)metal";
+
+const mlx::core::fast::CustomKernelFunction& lm_head_argmax_partials_kernel() {
+  static const auto kernel = mlx::core::fast::metal_kernel(
+      "lm_head_argmax_partials",
+      {"hidden", "embedding"},
+      {"partial_values", "partial_indices"},
+      kLmHeadArgmaxPartialsSource,
+      "",
+      true,
+      false);
+  return kernel;
+}
+
+const mlx::core::fast::CustomKernelFunction& lm_head_argmax_final_kernel() {
+  static const auto kernel = mlx::core::fast::metal_kernel(
+      "lm_head_argmax_final",
+      {"partial_values", "partial_indices"},
+      {"token"},
+      kLmHeadArgmaxFinalSource,
+      "",
+      true,
+      false);
+  return kernel;
+}
+
+} // namespace
+
 struct mlx_fast_cuda_kernel_config_cpp_ {
   std::vector<mlx::core::Shape> output_shapes;
   std::vector<mlx::core::Dtype> output_dtypes;
@@ -63,6 +215,74 @@ extern "C" int mlx_fast_compiled_swiglu(
     auto outputs = compiled_swiglu()(
         {mlx_array_get_(gate), mlx_array_get_(x)});
     mlx_array_set_(*res, std::move(outputs[0]));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+
+extern "C" int mlx_fast_lm_head_argmax(
+    mlx_array* res,
+    const mlx_array hidden,
+    const mlx_array embedding,
+    const mlx_stream s) {
+  try {
+    const auto& hidden_array = mlx_array_get_(hidden);
+    const auto& embedding_array = mlx_array_get_(embedding);
+    const auto stream = mlx_stream_get_(s);
+    const bool supported_dtype =
+        hidden_array.dtype() == mlx::core::float32 ||
+        hidden_array.dtype() == mlx::core::float16 ||
+        hidden_array.dtype() == mlx::core::bfloat16;
+    if (embedding_array.ndim() != 2 ||
+        hidden_array.size() != embedding_array.shape(1) ||
+        hidden_array.dtype() != embedding_array.dtype() ||
+        !supported_dtype || embedding_array.shape(0) < 8192 ||
+        embedding_array.shape(0) % 32 != 0) {
+      throw std::invalid_argument(
+          "[lm_head_argmax] expected matching FP32, FP16, or BF16 hidden=[H] and row-major embedding=[V,H], with V >= 8192 and divisible by 32.");
+    }
+
+    bool use_graph_fallback = stream.device == mlx::core::Device::cpu;
+#if !defined(__APPLE__)
+    use_graph_fallback = true;
+#endif
+    if (use_graph_fallback) {
+      auto logits = mlx::core::matmul(
+          hidden_array, mlx::core::transpose(embedding_array, stream), stream);
+      logits = mlx::core::reshape(
+          logits, {1, embedding_array.shape(0)}, stream);
+      auto output = mlx::core::astype(
+          mlx::core::argmax(logits, -1, false, stream),
+          mlx::core::int32,
+          stream);
+      mlx_array_set_(*res, std::move(output));
+      return 0;
+    }
+
+    const int partial_count = embedding_array.shape(0) / 32;
+    auto partials = lm_head_argmax_partials_kernel()(
+        {hidden_array, embedding_array},
+        {{partial_count}, {partial_count}},
+        {hidden_array.dtype(), mlx::core::uint32},
+        {partial_count * 256, 1, 1},
+        {256, 1, 1},
+        {{"T", hidden_array.dtype()}},
+        std::nullopt,
+        false,
+        stream);
+    auto output = lm_head_argmax_final_kernel()(
+        {partials.at(0), partials.at(1)},
+        {{1}},
+        {mlx::core::int32},
+        {256, 1, 1},
+        {256, 1, 1},
+        {{"T", hidden_array.dtype()}},
+        std::nullopt,
+        false,
+        stream);
+    mlx_array_set_(*res, std::move(output.at(0)));
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;
