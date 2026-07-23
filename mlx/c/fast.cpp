@@ -3,6 +3,9 @@
 /* This file is auto-generated. Do not edit manually. */
 /*                                                    */
 
+#include <algorithm>
+#include <bit>
+
 #include "mlx/c/fast.h"
 #include "mlx/c/error.h"
 #include "mlx/c/private/mlx.h"
@@ -23,6 +26,7 @@ auto& compiled_swiglu() {
       true);
   return compiled;
 }
+
 } // namespace
 
 namespace {
@@ -177,6 +181,173 @@ const mlx::core::fast::CustomKernelFunction& lm_head_argmax_final_kernel() {
 
 } // namespace
 
+namespace {
+
+constexpr const char* kSmolLmGemvSource = R"metal(
+  constexpr uint kSimdgroupsPerThreadgroup = 8;
+  constexpr uint kElementsPerThread = 4;
+  constexpr uint kReductionBlock = 128;
+
+  uint lane = thread_index_in_simdgroup;
+  uint simdgroup = simdgroup_index_in_threadgroup;
+  uint group = threadgroup_position_in_grid.x;
+  uint row_base =
+      (group * kSimdgroupsPerThreadgroup + simdgroup) * RESULTS;
+  uint input_size = weight_shape[1];
+  uint output_size = weight_shape[0];
+
+  float sums[RESULTS] = {0.0f};
+  for (uint block = 0; block < input_size; block += kReductionBlock) {
+    uint column = block + lane * kElementsPerThread;
+    for (uint element = 0; element < kElementsPerThread; ++element) {
+      uint current = column + element;
+      float coefficient = current < input_size
+          ? static_cast<float>(input[current])
+          : 0.0f;
+      for (uint result = 0; result < RESULTS; ++result) {
+        uint row = row_base + result;
+        float matrix_value = current < input_size && row < output_size
+            ? static_cast<float>(weight[row * input_size + current])
+            : 0.0f;
+        sums[result] += matrix_value * coefficient;
+      }
+    }
+  }
+
+  for (uint offset = 16; offset > 0; offset >>= 1) {
+    for (uint result = 0; result < RESULTS; ++result) {
+      sums[result] += simd_shuffle_down(sums[result], offset);
+    }
+  }
+
+  if (lane == 0) {
+    for (uint result = 0; result < RESULTS; ++result) {
+      uint row = row_base + result;
+      if (row < output_size) {
+        T value = static_cast<T>(sums[result]);
+        output[row] = HAS_RESIDUAL ? value + residual[row] : value;
+      }
+    }
+  }
+)metal";
+
+const mlx::core::fast::CustomKernelFunction& smollm_gemv_kernel() {
+  static const auto kernel = mlx::core::fast::metal_kernel(
+      "smollm_gemv",
+      {"input", "weight", "residual"},
+      {"output"},
+      kSmolLmGemvSource,
+      "",
+      true,
+      false);
+  return kernel;
+}
+
+constexpr const char* kSmolLmYarnRopeQkvSource = R"metal(
+  uint tid = thread_position_in_grid.x;
+  constexpr uint kHeadDim = 64;
+  constexpr uint kHalfDim = kHeadDim / 2;
+  uint query_heads = queries_shape[1];
+  uint kv_heads = keys_shape[1];
+  uint head = tid / kHalfDim;
+  uint pair = tid % kHalfDim;
+  uint first = head * kHeadDim + pair;
+  uint second = first + kHalfDim;
+
+  T attention_factor = static_cast<T>(
+      as_type<float>(static_cast<uint>(ATTENTION_FACTOR_BITS)));
+  float position = static_cast<float>(offset);
+  float inverse_frequency = 1.0f / freqs[pair];
+  float theta = position * inverse_frequency;
+  float cosine = metal::fast::cos(theta);
+  float sine = metal::fast::sin(theta);
+
+  if (head < query_heads) {
+    T q1 = queries[first] * attention_factor;
+    T q2 = queries[second] * attention_factor;
+    float x1 = static_cast<float>(q1);
+    float x2 = static_cast<float>(q2);
+    rotated_queries[first] = static_cast<T>(x1 * cosine - x2 * sine);
+    rotated_queries[second] = static_cast<T>(x1 * sine + x2 * cosine);
+  }
+
+  if (head < kv_heads) {
+    T k1 = keys[first] * attention_factor;
+    T k2 = keys[second] * attention_factor;
+    float x1 = static_cast<float>(k1);
+    float x2 = static_cast<float>(k2);
+    packed_kv[first] = static_cast<T>(x1 * cosine - x2 * sine);
+    packed_kv[second] = static_cast<T>(x1 * sine + x2 * cosine);
+    uint value_base = kv_heads * kHeadDim;
+    packed_kv[value_base + first] = values[first];
+    packed_kv[value_base + second] = values[second];
+  }
+)metal";
+
+const mlx::core::fast::CustomKernelFunction& smollm_yarn_rope_qkv_kernel() {
+  static const auto kernel = mlx::core::fast::metal_kernel(
+      "smollm_yarn_rope_qkv",
+      {"queries", "keys", "values", "freqs", "offset"},
+      {"rotated_queries", "packed_kv"},
+      kSmolLmYarnRopeQkvSource,
+      "",
+      true,
+      false);
+  return kernel;
+}
+
+constexpr const char* kSmolLmYarnRopeQkSource = R"metal(
+  uint tid = thread_position_in_grid.x;
+  constexpr uint kHeadDim = 64;
+  constexpr uint kHalfDim = kHeadDim / 2;
+  uint query_heads = queries_shape[1];
+  uint kv_heads = keys_shape[1];
+  uint head = tid / kHalfDim;
+  uint pair = tid % kHalfDim;
+  uint first = head * kHeadDim + pair;
+  uint second = first + kHalfDim;
+
+  T attention_factor = static_cast<T>(
+      as_type<float>(static_cast<uint>(ATTENTION_FACTOR_BITS)));
+  float position = static_cast<float>(offset);
+  float inverse_frequency = 1.0f / freqs[pair];
+  float theta = position * inverse_frequency;
+  float cosine = metal::fast::cos(theta);
+  float sine = metal::fast::sin(theta);
+
+  if (head < query_heads) {
+    T q1 = queries[first] * attention_factor;
+    T q2 = queries[second] * attention_factor;
+    float x1 = static_cast<float>(q1);
+    float x2 = static_cast<float>(q2);
+    rotated_queries[first] = static_cast<T>(x1 * cosine - x2 * sine);
+    rotated_queries[second] = static_cast<T>(x1 * sine + x2 * cosine);
+  }
+
+  if (head < kv_heads) {
+    T k1 = keys[first] * attention_factor;
+    T k2 = keys[second] * attention_factor;
+    float x1 = static_cast<float>(k1);
+    float x2 = static_cast<float>(k2);
+    rotated_keys[first] = static_cast<T>(x1 * cosine - x2 * sine);
+    rotated_keys[second] = static_cast<T>(x1 * sine + x2 * cosine);
+  }
+)metal";
+
+const mlx::core::fast::CustomKernelFunction& smollm_yarn_rope_qk_kernel() {
+  static const auto kernel = mlx::core::fast::metal_kernel(
+      "smollm_yarn_rope_qk",
+      {"queries", "keys", "freqs", "offset"},
+      {"rotated_queries", "rotated_keys"},
+      kSmolLmYarnRopeQkSource,
+      "",
+      true,
+      false);
+  return kernel;
+}
+
+} // namespace
+
 struct mlx_fast_cuda_kernel_config_cpp_ {
   std::vector<mlx::core::Shape> output_shapes;
   std::vector<mlx::core::Dtype> output_dtypes;
@@ -283,6 +454,239 @@ extern "C" int mlx_fast_lm_head_argmax(
         false,
         stream);
     mlx_array_set_(*res, std::move(output.at(0)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+
+extern "C" int mlx_fast_smollm_gemv(
+    mlx_array* res,
+    const mlx_array input,
+    const mlx_array weight,
+    const mlx_array residual,
+    int results_per_simdgroup,
+    const mlx_stream s) {
+  try {
+    const auto& input_array = mlx_array_get_(input);
+    const auto& weight_array = mlx_array_get_(weight);
+    const auto stream = mlx_stream_get_(s);
+    const bool has_residual = residual.ctx != nullptr;
+    const bool supported_dtype =
+        input_array.dtype() == mlx::core::float32 ||
+        input_array.dtype() == mlx::core::float16 ||
+        input_array.dtype() == mlx::core::bfloat16;
+    if (weight_array.ndim() != 2 || input_array.ndim() == 0 ||
+        input_array.size() != weight_array.shape(1) ||
+        input_array.dtype() != weight_array.dtype() || !supported_dtype ||
+        (results_per_simdgroup != 1 && results_per_simdgroup != 4)) {
+      throw std::invalid_argument(
+          "[smollm_gemv] expected matching FP32, FP16, or BF16 input=[K] "
+          "and row-major weight=[N,K], with results_per_simdgroup 1 or 4.");
+    }
+    if (has_residual) {
+      const auto& residual_array = mlx_array_get_(residual);
+      if (residual_array.size() != weight_array.shape(0) ||
+          residual_array.dtype() != input_array.dtype()) {
+        throw std::invalid_argument(
+            "[smollm_gemv] residual must contain N elements and match the input dtype.");
+      }
+    }
+
+    auto output_shape = input_array.shape();
+    output_shape.back() = weight_array.shape(0);
+    bool use_graph_fallback = stream.device == mlx::core::Device::cpu;
+#if !defined(__APPLE__)
+    use_graph_fallback = true;
+#endif
+    if (use_graph_fallback) {
+      auto output = mlx::core::matmul(
+          input_array, mlx::core::transpose(weight_array, stream), stream);
+      if (has_residual) {
+        output = mlx::core::add(output, mlx_array_get_(residual), stream);
+      }
+      mlx_array_set_(*res, std::move(output));
+      return 0;
+    }
+
+    const int rows_per_threadgroup = 8 * results_per_simdgroup;
+    const int threadgroups =
+        (weight_array.shape(0) + rows_per_threadgroup - 1) /
+        rows_per_threadgroup;
+    const auto& residual_array =
+        has_residual ? mlx_array_get_(residual) : input_array;
+    auto outputs = smollm_gemv_kernel()(
+        {input_array, weight_array, residual_array},
+        {output_shape},
+        {input_array.dtype()},
+        {threadgroups * 256, 1, 1},
+        {256, 1, 1},
+        {{"T", input_array.dtype()},
+         {"RESULTS", results_per_simdgroup},
+         {"HAS_RESIDUAL", has_residual}},
+        std::nullopt,
+        false,
+        stream);
+    mlx_array_set_(*res, std::move(outputs.at(0)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+
+extern "C" int mlx_fast_smollm_yarn_rope_qkv(
+    mlx_array* queries_res,
+    mlx_array* packed_kv_res,
+    const mlx_array queries,
+    const mlx_array keys,
+    const mlx_array values,
+    const mlx_array freqs,
+    float attention_factor,
+    int offset,
+    const mlx_stream s) {
+  try {
+    const auto& queries_array = mlx_array_get_(queries);
+    const auto& keys_array = mlx_array_get_(keys);
+    const auto& values_array = mlx_array_get_(values);
+    const auto& freqs_array = mlx_array_get_(freqs);
+    const auto stream = mlx_stream_get_(s);
+    const bool supported_dtype =
+        queries_array.dtype() == mlx::core::float32 ||
+        queries_array.dtype() == mlx::core::float16 ||
+        queries_array.dtype() == mlx::core::bfloat16;
+    if (queries_array.ndim() != 4 || keys_array.ndim() != 4 ||
+        values_array.shape() != keys_array.shape() ||
+        queries_array.shape(0) != 1 || queries_array.shape(2) != 1 ||
+        queries_array.shape(3) != 64 || keys_array.shape(0) != 1 ||
+        keys_array.shape(2) != 1 || keys_array.shape(3) != 64 ||
+        queries_array.shape(1) < keys_array.shape(1) ||
+        queries_array.dtype() != keys_array.dtype() ||
+        queries_array.dtype() != values_array.dtype() || !supported_dtype ||
+        freqs_array.ndim() != 1 || freqs_array.shape(0) != 32 ||
+        freqs_array.dtype() != mlx::core::float32 || attention_factor <= 0.0f ||
+        offset < 0) {
+      throw std::invalid_argument(
+          "[smollm_yarn_rope_qkv] expected matching one-token Q/K/V with "
+          "head_dim=64, FP32 frequencies=[32], and positive YaRN scaling.");
+    }
+
+    auto packed_shape = keys_array.shape();
+    packed_shape.insert(packed_shape.begin(), 2);
+    bool use_graph_fallback = stream.device == mlx::core::Device::cpu;
+#if !defined(__APPLE__)
+    use_graph_fallback = true;
+#endif
+    if (use_graph_fallback) {
+      auto factor = mlx::core::array(attention_factor, queries_array.dtype());
+      auto scaled_queries = mlx::core::multiply(queries_array, factor, stream);
+      auto scaled_keys = mlx::core::multiply(keys_array, factor, stream);
+      auto rotated_queries = mlx::core::fast::rope(
+          scaled_queries, 64, false, std::nullopt, 1.0f, offset,
+          std::make_optional(freqs_array), stream);
+      auto rotated_keys = mlx::core::fast::rope(
+          scaled_keys, 64, false, std::nullopt, 1.0f, offset,
+          std::make_optional(freqs_array), stream);
+      auto packed_kv = mlx::core::stack(
+          {rotated_keys, values_array}, stream);
+      mlx_array_set_(*queries_res, std::move(rotated_queries));
+      mlx_array_set_(*packed_kv_res, std::move(packed_kv));
+      return 0;
+    }
+
+    const int threads = queries_array.shape(1) * 32;
+    const int threadgroup_size = std::min(threads, 256);
+    const int attention_factor_bits = std::bit_cast<int>(attention_factor);
+    auto offset_array = mlx::core::array(offset);
+    auto outputs = smollm_yarn_rope_qkv_kernel()(
+        {queries_array, keys_array, values_array, freqs_array, offset_array},
+        {queries_array.shape(), packed_shape},
+        {queries_array.dtype(), queries_array.dtype()},
+        {threads, 1, 1},
+        {threadgroup_size, 1, 1},
+        {{"T", queries_array.dtype()},
+         {"ATTENTION_FACTOR_BITS", attention_factor_bits}},
+        std::nullopt,
+        false,
+        stream);
+    mlx_array_set_(*queries_res, std::move(outputs.at(0)));
+    mlx_array_set_(*packed_kv_res, std::move(outputs.at(1)));
+  } catch (std::exception& e) {
+    mlx_error(e.what());
+    return 1;
+  }
+  return 0;
+}
+
+extern "C" int mlx_fast_smollm_yarn_rope_qk(
+    mlx_array* queries_res,
+    mlx_array* keys_res,
+    const mlx_array queries,
+    const mlx_array keys,
+    const mlx_array freqs,
+    float attention_factor,
+    int offset,
+    const mlx_stream s) {
+  try {
+    const auto& queries_array = mlx_array_get_(queries);
+    const auto& keys_array = mlx_array_get_(keys);
+    const auto& freqs_array = mlx_array_get_(freqs);
+    const auto stream = mlx_stream_get_(s);
+    const bool supported_dtype =
+        queries_array.dtype() == mlx::core::float32 ||
+        queries_array.dtype() == mlx::core::float16 ||
+        queries_array.dtype() == mlx::core::bfloat16;
+    if (queries_array.ndim() != 4 || keys_array.ndim() != 4 ||
+        queries_array.shape(0) != 1 || queries_array.shape(2) != 1 ||
+        queries_array.shape(3) != 64 || keys_array.shape(0) != 1 ||
+        keys_array.shape(2) != 1 || keys_array.shape(3) != 64 ||
+        queries_array.shape(1) < keys_array.shape(1) ||
+        queries_array.dtype() != keys_array.dtype() || !supported_dtype ||
+        freqs_array.ndim() != 1 || freqs_array.shape(0) != 32 ||
+        freqs_array.dtype() != mlx::core::float32 || attention_factor <= 0.0f ||
+        offset < 0) {
+      throw std::invalid_argument(
+          "[smollm_yarn_rope_qk] expected matching one-token Q/K with "
+          "head_dim=64, FP32 frequencies=[32], and positive YaRN scaling.");
+    }
+
+    bool use_graph_fallback = stream.device == mlx::core::Device::cpu;
+#if !defined(__APPLE__)
+    use_graph_fallback = true;
+#endif
+    if (use_graph_fallback) {
+      auto factor = mlx::core::array(attention_factor, queries_array.dtype());
+      auto scaled_queries = mlx::core::multiply(queries_array, factor, stream);
+      auto scaled_keys = mlx::core::multiply(keys_array, factor, stream);
+      auto rotated_queries = mlx::core::fast::rope(
+          scaled_queries, 64, false, std::nullopt, 1.0f, offset,
+          std::make_optional(freqs_array), stream);
+      auto rotated_keys = mlx::core::fast::rope(
+          scaled_keys, 64, false, std::nullopt, 1.0f, offset,
+          std::make_optional(freqs_array), stream);
+      mlx_array_set_(*queries_res, std::move(rotated_queries));
+      mlx_array_set_(*keys_res, std::move(rotated_keys));
+      return 0;
+    }
+
+    const int threads = queries_array.shape(1) * 32;
+    const int threadgroup_size = std::min(threads, 256);
+    const int attention_factor_bits = std::bit_cast<int>(attention_factor);
+    auto offset_array = mlx::core::array(offset);
+    auto outputs = smollm_yarn_rope_qk_kernel()(
+        {queries_array, keys_array, freqs_array, offset_array},
+        {queries_array.shape(), keys_array.shape()},
+        {queries_array.dtype(), queries_array.dtype()},
+        {threads, 1, 1},
+        {threadgroup_size, 1, 1},
+        {{"T", queries_array.dtype()},
+         {"ATTENTION_FACTOR_BITS", attention_factor_bits}},
+        std::nullopt,
+        false,
+        stream);
+    mlx_array_set_(*queries_res, std::move(outputs.at(0)));
+    mlx_array_set_(*keys_res, std::move(outputs.at(1)));
   } catch (std::exception& e) {
     mlx_error(e.what());
     return 1;

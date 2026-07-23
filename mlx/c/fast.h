@@ -185,6 +185,44 @@ int mlx_fast_lm_head_argmax(
     const mlx_array hidden,
     const mlx_array embedding,
     const mlx_stream s);
+/**
+ * Compute one unbatched row-major matrix-vector product using a fixed Metal
+ * tile. The optional residual is fused with the output using MLX GEMV/AddMM
+ * rounding semantics. `results_per_simdgroup` must be 1 or 4.
+ */
+int mlx_fast_smollm_gemv(
+    mlx_array* res,
+    const mlx_array input,
+    const mlx_array weight,
+    const mlx_array residual /* may be null */,
+    int results_per_simdgroup,
+    const mlx_stream s);
+/**
+ * Apply SmolLM YaRN scaling and non-interleaved RoPE to one-token Q/K, while
+ * packing the rotated K and unchanged V as [2,B,H,1,D].
+ */
+int mlx_fast_smollm_yarn_rope_qkv(
+    mlx_array* queries_res,
+    mlx_array* packed_kv_res,
+    const mlx_array queries,
+    const mlx_array keys,
+    const mlx_array values,
+    const mlx_array freqs,
+    float attention_factor,
+    int offset,
+    const mlx_stream s);
+/**
+ * Apply SmolLM YaRN scaling and non-interleaved RoPE to one-token Q/K.
+ */
+int mlx_fast_smollm_yarn_rope_qk(
+    mlx_array* queries_res,
+    mlx_array* keys_res,
+    const mlx_array queries,
+    const mlx_array keys,
+    const mlx_array freqs,
+    float attention_factor,
+    int offset,
+    const mlx_stream s);
 int mlx_fast_rope(
     mlx_array* res,
     const mlx_array x,
