@@ -175,10 +175,10 @@ int mlx_fast_compiled_swiglu(
     const mlx_array gate,
     const mlx_array x);
 /**
- * Compute argmax(hidden @ embedding.T) without exposing the full logits
- * vector. Hidden must contain exactly one vector. The rank-2 embedding table
- * must contain at least 8192 rows and its row count must be divisible by 32.
- * Both inputs must use the same FP32, FP16, or BF16 dtype.
+ * Compute argmax(hidden @ embedding.T) without exposing the full logits.
+ * Leading hidden dimensions are flattened into independent batch rows. The
+ * rank-2 embedding table must contain at least 8192 rows and its row count must
+ * be divisible by 32. Both inputs must use the same FP32, FP16, or BF16 dtype.
  */
 int mlx_fast_lm_head_argmax(
     mlx_array* res,
@@ -186,9 +186,10 @@ int mlx_fast_lm_head_argmax(
     const mlx_array embedding,
     const mlx_stream s);
 /**
- * Compute one unbatched row-major matrix-vector product using a fixed Metal
- * tile. The optional residual is fused with the output using MLX GEMV/AddMM
- * rounding semantics. `results_per_simdgroup` must be 1 or 4.
+ * Compute batched row-major matrix-vector products using a fixed Metal tile.
+ * Leading input dimensions are flattened into independent batch rows. The
+ * optional residual is fused with the output using MLX GEMV/AddMM rounding
+ * semantics. `results_per_simdgroup` must be 1 or 4.
  */
 int mlx_fast_smollm_gemv(
     mlx_array* res,

@@ -40,10 +40,13 @@ constexpr const char* kLmHeadArgmaxPartialsSource = R"metal(
   uint lane = thread_index_in_simdgroup;
   uint simdgroup = simdgroup_index_in_threadgroup;
   uint group = threadgroup_position_in_grid.x;
+  uint batch = threadgroup_position_in_grid.y;
   uint row_base = group * kRowsPerThreadgroup +
       simdgroup * kRowsPerSimdgroup;
   uint hidden_size = embedding_shape[1];
   uint vocab_size = embedding_shape[0];
+  uint partial_count = embedding_shape[0] / kRowsPerThreadgroup;
+  uint hidden_base = batch * hidden_size;
 
   float sums[kRowsPerSimdgroup] = {0.0f};
   for (uint block = 0; block < hidden_size; block += kHiddenBlock) {
@@ -51,7 +54,7 @@ constexpr const char* kLmHeadArgmaxPartialsSource = R"metal(
     for (uint element = 0; element < kElementsPerThread; ++element) {
       uint current = column + element;
       float coefficient = current < hidden_size
-          ? static_cast<float>(hidden[current])
+          ? static_cast<float>(hidden[hidden_base + current])
           : 0.0f;
       for (uint row = 0; row < kRowsPerSimdgroup; ++row) {
         uint vocab_row = row_base + row;
@@ -95,22 +98,25 @@ constexpr const char* kLmHeadArgmaxPartialsSource = R"metal(
       }
     }
     if (lane == 0) {
-      partial_values[group] = best_value;
-      partial_indices[group] = best_index;
+      uint partial_index = batch * partial_count + group;
+      partial_values[partial_index] = best_value;
+      partial_indices[partial_index] = best_index;
     }
   }
 )metal";
 
 constexpr const char* kLmHeadArgmaxFinalSource = R"metal(
   uint tid = thread_position_in_threadgroup.x;
-  uint partial_count = partial_values_shape[0];
-  T best_value = partial_values[tid];
-  uint best_index = partial_indices[tid];
+  uint batch = threadgroup_position_in_grid.y;
+  uint partial_count = partial_values_shape[1];
+  uint partial_base = batch * partial_count;
+  T best_value = partial_values[partial_base + tid];
+  uint best_index = partial_indices[partial_base + tid];
   for (uint index = tid + threads_per_threadgroup.x;
        index < partial_count;
        index += threads_per_threadgroup.x) {
-    T candidate_value = partial_values[index];
-    uint candidate_index = partial_indices[index];
+    T candidate_value = partial_values[partial_base + index];
+    uint candidate_index = partial_indices[partial_base + index];
     if (best_value < candidate_value ||
         (best_value == candidate_value && best_index > candidate_index)) {
       best_value = candidate_value;
@@ -150,7 +156,7 @@ constexpr const char* kLmHeadArgmaxFinalSource = R"metal(
       }
     }
     if (lane == 0) {
-      token[0] = static_cast<int>(group_index);
+      token[batch] = static_cast<int>(group_index);
     }
   }
 )metal";
@@ -191,10 +197,13 @@ constexpr const char* kSmolLmGemvSource = R"metal(
   uint lane = thread_index_in_simdgroup;
   uint simdgroup = simdgroup_index_in_threadgroup;
   uint group = threadgroup_position_in_grid.x;
+  uint batch = threadgroup_position_in_grid.y;
   uint row_base =
       (group * kSimdgroupsPerThreadgroup + simdgroup) * RESULTS;
   uint input_size = weight_shape[1];
   uint output_size = weight_shape[0];
+  uint input_base = batch * input_size;
+  uint output_base = batch * output_size;
 
   float sums[RESULTS] = {0.0f};
   for (uint block = 0; block < input_size; block += kReductionBlock) {
@@ -202,7 +211,7 @@ constexpr const char* kSmolLmGemvSource = R"metal(
     for (uint element = 0; element < kElementsPerThread; ++element) {
       uint current = column + element;
       float coefficient = current < input_size
-          ? static_cast<float>(input[current])
+          ? static_cast<float>(input[input_base + current])
           : 0.0f;
       for (uint result = 0; result < RESULTS; ++result) {
         uint row = row_base + result;
@@ -225,7 +234,10 @@ constexpr const char* kSmolLmGemvSource = R"metal(
       uint row = row_base + result;
       if (row < output_size) {
         T value = static_cast<T>(sums[result]);
-        output[row] = HAS_RESIDUAL ? value + residual[row] : value;
+        uint output_index = output_base + row;
+        output[output_index] = HAS_RESIDUAL
+            ? value + residual[output_index]
+            : value;
       }
     }
   }
@@ -406,14 +418,16 @@ extern "C" int mlx_fast_lm_head_argmax(
         hidden_array.dtype() == mlx::core::float32 ||
         hidden_array.dtype() == mlx::core::float16 ||
         hidden_array.dtype() == mlx::core::bfloat16;
-    if (embedding_array.ndim() != 2 ||
-        hidden_array.size() != embedding_array.shape(1) ||
+    if (embedding_array.ndim() != 2 || hidden_array.ndim() == 0 ||
+        hidden_array.size() == 0 || embedding_array.shape(1) == 0 ||
+        hidden_array.shape().back() != embedding_array.shape(1) ||
         hidden_array.dtype() != embedding_array.dtype() ||
         !supported_dtype || embedding_array.shape(0) < 8192 ||
         embedding_array.shape(0) % 32 != 0) {
       throw std::invalid_argument(
-          "[lm_head_argmax] expected matching FP32, FP16, or BF16 hidden=[H] and row-major embedding=[V,H], with V >= 8192 and divisible by 32.");
+          "[lm_head_argmax] expected matching FP32, FP16, or BF16 hidden=[...,H] and row-major embedding=[V,H], with V >= 8192 and divisible by 32.");
     }
+    const int batch_size = hidden_array.size() / embedding_array.shape(1);
 
     bool use_graph_fallback = stream.device == mlx::core::Device::cpu;
 #if !defined(__APPLE__)
@@ -423,7 +437,7 @@ extern "C" int mlx_fast_lm_head_argmax(
       auto logits = mlx::core::matmul(
           hidden_array, mlx::core::transpose(embedding_array, stream), stream);
       logits = mlx::core::reshape(
-          logits, {1, embedding_array.shape(0)}, stream);
+          logits, {batch_size, embedding_array.shape(0)}, stream);
       auto output = mlx::core::astype(
           mlx::core::argmax(logits, -1, false, stream),
           mlx::core::int32,
@@ -435,9 +449,9 @@ extern "C" int mlx_fast_lm_head_argmax(
     const int partial_count = embedding_array.shape(0) / 32;
     auto partials = lm_head_argmax_partials_kernel()(
         {hidden_array, embedding_array},
-        {{partial_count}, {partial_count}},
+        {{batch_size, partial_count}, {batch_size, partial_count}},
         {hidden_array.dtype(), mlx::core::uint32},
-        {partial_count * 256, 1, 1},
+        {partial_count * 256, batch_size, 1},
         {256, 1, 1},
         {{"T", hidden_array.dtype()}},
         std::nullopt,
@@ -445,9 +459,9 @@ extern "C" int mlx_fast_lm_head_argmax(
         stream);
     auto output = lm_head_argmax_final_kernel()(
         {partials.at(0), partials.at(1)},
-        {{1}},
+        {{batch_size}},
         {mlx::core::int32},
-        {256, 1, 1},
+        {256, batch_size, 1},
         {256, 1, 1},
         {{"T", hidden_array.dtype()}},
         std::nullopt,
@@ -478,19 +492,21 @@ extern "C" int mlx_fast_smollm_gemv(
         input_array.dtype() == mlx::core::float16 ||
         input_array.dtype() == mlx::core::bfloat16;
     if (weight_array.ndim() != 2 || input_array.ndim() == 0 ||
-        input_array.size() != weight_array.shape(1) ||
+        input_array.size() == 0 || weight_array.shape(1) == 0 ||
+        input_array.shape().back() != weight_array.shape(1) ||
         input_array.dtype() != weight_array.dtype() || !supported_dtype ||
         (results_per_simdgroup != 1 && results_per_simdgroup != 4)) {
       throw std::invalid_argument(
-          "[smollm_gemv] expected matching FP32, FP16, or BF16 input=[K] "
+          "[smollm_gemv] expected matching FP32, FP16, or BF16 input=[...,K] "
           "and row-major weight=[N,K], with results_per_simdgroup 1 or 4.");
     }
+    const int batch_size = input_array.size() / weight_array.shape(1);
     if (has_residual) {
       const auto& residual_array = mlx_array_get_(residual);
-      if (residual_array.size() != weight_array.shape(0) ||
+      if (residual_array.size() != batch_size * weight_array.shape(0) ||
           residual_array.dtype() != input_array.dtype()) {
         throw std::invalid_argument(
-            "[smollm_gemv] residual must contain N elements and match the input dtype.");
+            "[smollm_gemv] residual must match the batched output element count and input dtype.");
       }
     }
 
@@ -520,7 +536,7 @@ extern "C" int mlx_fast_smollm_gemv(
         {input_array, weight_array, residual_array},
         {output_shape},
         {input_array.dtype()},
-        {threadgroups * 256, 1, 1},
+        {threadgroups * 256, batch_size, 1},
         {256, 1, 1},
         {{"T", input_array.dtype()},
          {"RESULTS", results_per_simdgroup},
