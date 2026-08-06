@@ -47,7 +47,8 @@ else()
       ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-shapeless-split-output-shapes.patch
       ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-addmm-gelu-experiment.patch
       ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-addmm-gelu-api.patch
-      ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-precise-power.patch)
+      ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-precise-power.patch
+      ${CMAKE_CURRENT_LIST_DIR}/patches/mlx-kernel-cache-shared-read.patch)
   FetchContent_MakeAvailable(mlx)
 endif()
 
